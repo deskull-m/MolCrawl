@@ -31,6 +31,13 @@ continued another is written ``DIR@STEP``, where STEP is the step it resumed fro
 
     audit_save_on_improve_metric.py --run DIR[@RESUME_STEP] [--run ...] --out FILE
 
+The output follows the report TSV convention
+(docs/07-reports/report_tsv_columns.md): the name begins with ``rt1-`` and the
+provenance block is written from the start. The outcome is two columns rather
+than one sentence -- ``outcome`` out of a fixed four-word vocabulary, and
+``metric_followed`` naming the series when there is one -- so that a reader can
+tell what kind of value a cell holds without reading Japanese prose out of it.
+
 Read-only: log_history out of the furthest checkpoint, and the names of the
 checkpoint directories. Paths are arguments; this repository is public.
 """
@@ -38,15 +45,33 @@ checkpoint directories. Paths are arguments; this repository is public.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
+import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from report_tsv import check_name, stamp, write_tsv  # noqa: E402
 
 JUDGED = "eval_loss_mask"
 OTHER = "eval_loss"
 
+#: ``outcome`` holds one of these four and nothing else. The Japanese sentences
+#: this column used to carry are in the console output and in the report, where a
+#: sentence belongs; a column whose values are prose cannot be filtered or counted.
+FOLLOWED = "followed"           # one series carries every off-grid checkpoint
+NO_OFF_GRID = "no_off_grid_saves"   # the stage wrote nothing off the save_steps grid
+SERIES_AGREE = "series_agree"   # the two series pick the same steps: no evidence
+INCONCLUSIVE = "inconclusive"   # they differ, but neither covers every checkpoint
+OUTCOMES = (FOLLOWED, NO_OFF_GRID, SERIES_AGREE, INCONCLUSIVE)
+
+#: ``eval_points`` counts the evaluation points in the run's history. Both series
+#: are logged at the same points, which is checked per run rather than assumed, so
+#: one column holds it. It used to be two columns named after the metrics, which
+#: said they held a metric's name and held a count instead.
 COLUMNS = ["run", "resumed_at", "save_steps", "checkpoints", "off_grid",
-           "judged_metric", "other_metric", "on_judged", "on_other", "verdict",
+           "eval_points", "on_judged", "on_other", "outcome", "metric_followed",
            "best_metric_recorded", "best_checkpoint_step", "judged_min_step",
            "judged_min", "source"]
 
@@ -120,16 +145,17 @@ def audit(run: Path, save_steps: int, resumed_at: int = 0) -> dict:
 
     # The two series must disagree somewhere for the comparison to mean anything.
     discriminates = j_steps != o_steps
+    followed = ""
     if not off_grid:
-        verdict = "追加保存なし"
+        outcome = NO_OFF_GRID
     elif not discriminates:
-        verdict = "判定不能（2 系列が同じ step を選ぶ）"
+        outcome = SERIES_AGREE
     elif len(on_judged) == len(off_grid) and len(on_other) < len(off_grid):
-        verdict = JUDGED
+        outcome, followed = FOLLOWED, JUDGED
     elif len(on_other) == len(off_grid) and len(on_judged) < len(off_grid):
-        verdict = OTHER
+        outcome, followed = FOLLOWED, OTHER
     else:
-        verdict = "どちらとも言えない"
+        outcome = INCONCLUSIVE
 
     best_ck = state.get("best_model_checkpoint") or ""
     # The field holds an absolute path written at train time; only its step is read,
@@ -143,11 +169,14 @@ def audit(run: Path, save_steps: int, resumed_at: int = 0) -> dict:
         "save_steps": save_steps,
         "checkpoints": len(kept),
         "off_grid": len(off_grid),
-        "judged_metric": len(judged),
-        "other_metric": len(other),
+        "eval_points": len(judged),
+        # Reported rather than assumed: the single column above is the count of
+        # both series only while they are logged at the same points.
+        "eval_points_agree": len(judged) == len(other),
         "on_judged": f"{len(on_judged)}/{len(off_grid)}",
         "on_other": f"{len(on_other)}/{len(off_grid)}",
-        "verdict": verdict,
+        "outcome": outcome,
+        "metric_followed": followed or None,
         "best_metric_recorded": ("" if state.get("best_metric") is None
                                  else f"{state['best_metric']:.6f}"),
         "best_checkpoint_step": best_step,
@@ -164,20 +193,45 @@ def main(argv=None) -> int:
                          "repeat for several")
     ap.add_argument("--save-steps", type=int, default=1000,
                     help="the periodic save interval the run was configured with")
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--model", default="several (columns: run)",
+                    help="the provenance's model line; the runs given are not all "
+                         "one model, so the default names the column that tells "
+                         "them apart")
+    ap.add_argument("--out", type=Path, required=True,
+                    help="the base name begins with rt1- (the column convention)")
     args = ap.parse_args(argv)
+    check_name(args.out)
 
     rows = []
     for spec in args.run:
         run, resumed_at = split_run(spec)
         rows.append(audit(run, args.save_steps, resumed_at))
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=COLUMNS, delimiter="\t",
-                                lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
+    # The count column stands for both series, so a run where that is not true is
+    # said out loud rather than folded into one number.
+    disagreeing = [r["run"] for r in rows if not r["eval_points_agree"]]
+    for row in rows:
+        del row["eval_points_agree"]
+    note = [
+        f"eval_points counts the steps at which {JUDGED} was logged; both series "
+        f"are logged at the same points, which was true of every run here",
+        f"on_judged and on_other are <on that series>/<off_grid>; outcome is one of "
+        f"{', '.join(OUTCOMES)} and metric_followed is filled only for {FOLLOWED}",
+    ]
+    if disagreeing:
+        note[0] = (f"eval_points counts the steps at which {JUDGED} was logged; "
+                   f"{OTHER} was logged at a different number of points in: "
+                   f"{', '.join(disagreeing)}")
+    write_tsv(args.out, COLUMNS, rows, {
+        "model": args.model,
+        "source": "the source column names the trainer_state.json each row was "
+                  "read from; log_history and the checkpoint directory names",
+        "generated": stamp("scripts/audit_save_on_improve_metric.py"),
+        "note": note,
+        "job": os.environ.get("SLURM_JOB_ID") or None,
+    })
+    if disagreeing:
+        print(f"\n** 2 系列の評価点数が違う run: {', '.join(disagreeing)}")
 
     for row in rows:
         print(f"\n{row['run']}  (step {row['resumed_at']:,} から)")
@@ -185,7 +239,8 @@ def main(argv=None) -> int:
               f"{args.save_steps} の倍数でないもの {row['off_grid']} 本")
         print(f"  {JUDGED} の改善点に乗る: {row['on_judged']}")
         print(f"  {OTHER} の改善点に乗る:      {row['on_other']}")
-        print(f"  判定: {row['verdict']}")
+        print(f"  判定: {row['outcome']}"
+              + (f" ({row['metric_followed']})" if row["metric_followed"] else ""))
         print(f"  best_metric {row['best_metric_recorded']} / "
               f"best_model_checkpoint step {row['best_checkpoint_step']} / "
               f"{JUDGED} の最小 {row['judged_min']} @ {row['judged_min_step']}")

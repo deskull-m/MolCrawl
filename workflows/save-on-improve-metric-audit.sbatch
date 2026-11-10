@@ -48,8 +48,13 @@ echo "=== save-on-improve metric audit on ${SLURMD_NODENAME} @ $(date -Is) ==="
 echo "tree:       ${REPO}  $(git rev-parse --abbrev-ref HEAD) $(git rev-parse --short HEAD)"
 echo "save_steps: ${SAVE_STEPS}"
 echo "output:     ${SOI_OUT}"
+# The provenance's model line, when the caller can say more than the
+# script can work out from the run directories alone.
+MODEL_ARGS=()
+[ -n "${SOI_MODEL:-}" ] && MODEL_ARGS+=(--model "${SOI_MODEL}")
+
 "${PYTHON}" scripts/audit_save_on_improve_metric.py \
-    "${ARGS[@]}" --save-steps "${SAVE_STEPS}" --out "${SOI_OUT}"
+    "${ARGS[@]}" --save-steps "${SAVE_STEPS}" "${MODEL_ARGS[@]}" --out "${SOI_OUT}"
 rc=$?
 echo "=== rc=${rc} @ $(date -Is) ==="
 exit "${rc}"
